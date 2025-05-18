@@ -11,8 +11,11 @@
 (define-constant contract-admin tx-sender)
 (define-constant minimum-stake-requirement u1000000) ;; 1 STX minimum stake
 (define-constant staking-lockup-period u144) ;; ~24 hours at 10 min/block
+(define-constant maximum-claim-amount u100000000) ;; 100 STX maximum claim amount
+(define-constant maximum-reward-rate u1000) ;; 10% maximum reward rate (basis points)
+(define-constant minimum-justification-length u5) ;; Minimum length for claim justification
 
-;; Error codes - using kebab-case with ERR prefix
+;; Error codes
 (define-constant ERR-UNAUTHORIZED-ACCESS (err u100))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u101))
 (define-constant ERR-STAKE-NOT-FOUND (err u102))
@@ -21,6 +24,10 @@
 (define-constant ERR-MINIMUM-STAKE-REQUIREMENT (err u105))
 (define-constant ERR-LOCKUP-PERIOD-ACTIVE (err u106))
 (define-constant ERR-THRESHOLD-LIMIT-EXCEEDED (err u107))
+(define-constant ERR-MAXIMUM-CLAIM-EXCEEDED (err u108))
+(define-constant ERR-MAXIMUM-REWARD-RATE-EXCEEDED (err u109))
+(define-constant ERR-INVALID-INPUT (err u110))
+(define-constant ERR-JUSTIFICATION-TOO-SHORT (err u111))
 
 ;; Data Structures
 
@@ -77,6 +84,11 @@
 ;; Get historical insurance payouts
 (define-read-only (get-historical-payouts)
   (var-get total-insurance-payouts)
+)
+
+;; Helper function to check string length
+(define-read-only (get-string-length (some-string (string-utf8 256)))
+  (len some-string)
 )
 
 ;; Calculate pending reward distribution for a participant
@@ -220,11 +232,20 @@
     (participant-record (get-participant-details tx-sender))
     (staked-amount (get staked-amount participant-record))
     (next-claim-id (var-get claim-sequence-counter))
+    (justification-length (get-string-length claim-justification))
   )
     ;; Verify submitter is a staking participant
     (asserts! (> staked-amount u0) ERR-STAKE-NOT-FOUND)
     
-    ;; Register new claim in registry
+    ;; Validate the requested payout amount
+    (asserts! (and (> requested-amount u0) (<= requested-amount maximum-claim-amount)) 
+              ERR-MAXIMUM-CLAIM-EXCEEDED)
+    
+    ;; Validate justification length to ensure it's not empty or too short
+    (asserts! (>= justification-length minimum-justification-length) 
+              ERR-JUSTIFICATION-TOO-SHORT)
+    
+    ;; Register new claim in registry with validated inputs
     (map-set claim-registry
       { claim-reference-id: next-claim-id }
       { 
@@ -232,7 +253,7 @@
         requested-payout: requested-amount, 
         claim-justification: claim-justification, 
         submission-block-height: block-height,
-        claim-status: "pending"
+        claim-status: u"pending"
       }
     )
     
@@ -255,7 +276,7 @@
     (asserts! (is-eq tx-sender contract-admin) ERR-UNAUTHORIZED-ACCESS)
     
     ;; Ensure claim is in pending status
-    (asserts! (is-eq current-status "pending") ERR-CLAIM-ALREADY-PROCESSED)
+    (asserts! (is-eq current-status u"pending") ERR-CLAIM-ALREADY-PROCESSED)
     
     ;; For approved claims, verify sufficient pool liquidity
     (asserts! (or (not approve-claim) (>= (var-get pool-total-balance) requested-payout)) 
@@ -269,7 +290,7 @@
         ;; Update claim status to approved
         (map-set claim-registry
           { claim-reference-id: claim-reference-id }
-          (merge claim-record { claim-status: "approved" })
+          (merge claim-record { claim-status: u"approved" })
         )
         
         ;; Update protocol accounting
@@ -282,7 +303,7 @@
         ;; Update claim status to denied
         (map-set claim-registry
           { claim-reference-id: claim-reference-id }
-          (merge claim-record { claim-status: "denied" })
+          (merge claim-record { claim-status: u"denied" })
         )
         
         (ok false)
@@ -296,8 +317,15 @@
 ;; Update protocol reward distribution rate
 (define-public (configure-reward-rate (new-rate-basis-points uint))
   (begin
+    ;; Verify caller is contract administrator
     (asserts! (is-eq tx-sender contract-admin) ERR-UNAUTHORIZED-ACCESS)
+    
+    ;; Validate the new reward rate
+    (asserts! (<= new-rate-basis-points maximum-reward-rate) ERR-MAXIMUM-REWARD-RATE-EXCEEDED)
+    
+    ;; Update the reward rate
     (var-set annual-reward-rate new-rate-basis-points)
+    
     (ok new-rate-basis-points)
   )
 )
@@ -305,9 +333,16 @@
 ;; Adjust governance threshold for claim approvals
 (define-public (configure-governance-threshold (new-threshold-basis-points uint))
   (begin
+    ;; Verify caller is contract administrator
     (asserts! (is-eq tx-sender contract-admin) ERR-UNAUTHORIZED-ACCESS)
+    
+    ;; Validate the new threshold
     (asserts! (<= new-threshold-basis-points u10000) ERR-THRESHOLD-LIMIT-EXCEEDED)
+    (asserts! (> new-threshold-basis-points u0) ERR-INVALID-INPUT)
+    
+    ;; Update the threshold
     (var-set governance-approval-threshold new-threshold-basis-points)
+    
     (ok new-threshold-basis-points)
   )
 )
